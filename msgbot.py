@@ -1,428 +1,369 @@
-import os
-import json
-import logging
-import threading
+import os, re, json, logging, threading, tempfile
 from datetime import datetime
+from urllib.parse import urlparse
+from pathlib import Path
 import pytz
 from flask import Flask
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ChatMemberHandler, ContextTypes, filters)
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ChatMemberUpdated
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ChatMemberHandler,
-    ContextTypes,
-    filters
-)
+# Paste a NEW BotFather token here before uploading/deploying.
+# The previously shared token should be revoked and must not be reused.
+TOKEN = 'PASTE_NEW_BOT_TOKEN_HERE'
+OWNER_ID = 8984439807
+DATA_FILE = Path('bot_data.json')
+TZ = pytz.timezone('Asia/Kolkata')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('dispatcher')
 
-# ----------------- Configuration & Logging -----------------
-TOKEN = "8863781796:AAFTF6HVU5fD653V3lCgnJw2echi4iENRM0"
-DATA_FILE = "bot_data.json"
-TIMEZONE = pytz.timezone("Asia/Kolkata")
+DEFAULT_DB = {
+    'channels': {},       # chat_id -> title
+    'platforms': {},      # key -> {name, domains, channels, times, count, backup, enabled}
+    'queue': [],          # items have platform, content, sent_to, attempts
+    'history': [],
+    'unknown_queue': [],
+    'last_dispatch': {}
+}
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
-# ----------------- Database / State -----------------
-def load_data():
-    if os.path.exists(DATA_FILE):
+def load_db():
+    if DATA_FILE.exists():
         try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "channels": {},
-        "scheduled_times": [],
-        "send_count": 1,
-        "backup_channel": "",
-        "queue": []
-    }
+            data = json.loads(DATA_FILE.read_text(encoding='utf-8'))
+            for k, v in DEFAULT_DB.items(): data.setdefault(k, v.copy() if isinstance(v, (dict,list)) else v)
+            return data
+        except Exception as exc: log.exception('Could not load database: %s', exc)
+    return json.loads(json.dumps(DEFAULT_DB))
 
-def save_data():
-    with open(DATA_FILE, "w") as f:
-        json.dump(bot_db, f, indent=4)
+db = load_db()
 
-bot_db = load_data()
+def save_db():
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(dir=str(DATA_FILE.parent), prefix='botdata_', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f: json.dump(db, f, ensure_ascii=False, indent=2)
+        os.replace(temp_name, DATA_FILE)
+    finally:
+        if os.path.exists(temp_name): os.unlink(temp_name)
 
-# ----------------- Flask Web Server -----------------
-flask_app = Flask(__name__)
+def is_owner(update: Update):
+    return bool(update.effective_user and OWNER_ID and update.effective_user.id == OWNER_ID)
 
-@flask_app.route('/')
-@flask_app.route('/healthz')
-def home():
-    return "Bot is running!"
+MAIN_KB = ReplyKeyboardMarkup([
+    ['➕ Add Channel', '📢 Channels'],
+    ['➕ Add Platform', '⚙️ Manage Platforms'],
+    ['📥 Queues', '⏰ Schedules'],
+    ['📊 Statistics', '⏸ Pause / Resume'],
+    ['🧭 Review Unknown', '🗑 Remove Channel'],
+    ['🧹 Clear Queue', '❓ Help']
+], resize_keyboard=True)
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
+app_flask = Flask(__name__)
+@app_flask.route('/')
+@app_flask.route('/healthz')
+def health(): return 'Dispatcher bot is running.'
+def run_web(): app_flask.run(host='0.0.0.0', port=int(os.getenv('PORT', '8080')))
 
-# ----------------- Keyboards -----------------
-def get_main_keyboard():
-    return ReplyKeyboardMarkup([
-        ["➕ Add Channel", "⏰ Set Time"],
-        ["🔢 Set Count", "🗑 Delete Channel"],
-        ["📋 Queue", "❌ Delete Queue"],
-        ["🔗 Add Backup Channel"]
-    ], resize_keyboard=True)
+def norm_domain(raw):
+    raw = raw.strip().lower()
+    if not raw: return ''
+    if '://' not in raw: raw = 'https://' + raw
+    host = urlparse(raw).netloc.lower().split('@')[-1].split(':')[0]
+    return host[4:] if host.startswith('www.') else host
 
-# ----------------- Auto-Admin Tracker -----------------
-# Jokhon-i user bot-ke kono channel-e admin banabe, Telegram ei event trigger korbe
-async def handle_bot_promoted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = update.my_chat_member
-    if not result:
-        return
+def extract_urls(text):
+    if not text: return []
+    found = re.findall(r'(?i)(?:https?://|www\.)[^\s<>]+', text)
+    cleaned = []
+    for u in found:
+        u = u.rstrip('.,!?;:)]}')
+        if u.startswith('www.'): u = 'https://' + u
+        if u not in cleaned: cleaned.append(u)
+    return cleaned
 
-    chat = result.chat
-    new_status = result.new_chat_member.status
+def identify_platform(text):
+    urls = extract_urls(text)
+    for key, p in db['platforms'].items():
+        domains = [norm_domain(d) for d in p.get('domains', [])]
+        for url in urls:
+            host = norm_domain(url)
+            if any(host == d or host.endswith('.' + d) for d in domains if d):
+                return key, url
+    return None, (urls[0] if urls else '')
 
-    # Channel-e Bot promote hole auto-register
-    if chat.type == "channel" and new_status == "administrator":
-        chat_id = str(chat.id)
-        title = chat.title or f"Channel {chat_id}"
-        bot_db["channels"][chat_id] = title
-        save_data()
+def platform_key(name):
+    base = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'platform'
+    key, n = base, 2
+    while key in db['platforms']:
+        key, n = f'{base}_{n}', n + 1
+    return key
 
-        # Bot admin bananowar por channel owner/user-ke DM pathabe
-        try:
-            user_id = result.from_user.id
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ **Channel Auto-Added!**\n\n"
-                     f"📢 **Channel:** {title}\n"
-                     f"🆔 **ID:** `{chat_id}`\n\n"
-                     f"Bot has been successfully linked and ready to post!",
-                parse_mode="Markdown",
-                reply_markup=get_main_keyboard()
-            )
-        except Exception:
-            pass
+def platform_keyboard(prefix='plat'):
+    rows = [[InlineKeyboardButton(p['name'], callback_data=f'{prefix}:{k}')]
+            for k,p in db['platforms'].items()]
+    return InlineKeyboardMarkup(rows) if rows else None
 
-# ----------------- Command & Message Handlers -----------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update): return
     context.user_data.clear()
-    bot_info = await context.bot.get_me()
-    context.bot_data["username"] = bot_info.username
+    await update.message.reply_text('Cancelled.', reply_markup=MAIN_KB)
 
-    await update.message.reply_text(
-        "👋 Welcome! Automated Channel Dispatcher is Online.\n"
-        "Click the buttons below to manage your channels and posts.",
-        reply_markup=get_main_keyboard()
-    )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text('This is a private owner-only bot.')
+        return
+    context.user_data.clear()
+    await update.message.reply_text('Welcome to Multi-Platform Channel Dispatcher.\nChoose an option:', reply_markup=MAIN_KB)
+
+async def add_channel_help(update, context):
+    me = await context.bot.get_me()
+    url = f'https://t.me/{me.username}?startchannel=botstart&admin=post_messages+edit_messages'
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton('➕ Select Channel and add bot', url=url)]])
+    await update.message.reply_text('Add the bot as an administrator in each channel. It needs permission to post messages. The channel will be detected automatically.', reply_markup=kb)
+
+async def on_bot_membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    change = update.my_chat_member
+    if not change or change.chat.type != 'channel' or change.new_chat_member.status != 'administrator': return
+    if not OWNER_ID or change.from_user.id != OWNER_ID: return
+    cid = str(change.chat.id)
+    db['channels'][cid] = change.chat.title or cid
+    save_db()
+    try: await context.bot.send_message(OWNER_ID, f'✅ Channel added: {db["channels"][cid]}\nNow use Manage Platforms → choose a platform → Assign channels.')
+    except Exception: pass
+
+async def show_platforms(update):
+    if not db['platforms']:
+        await update.message.reply_text('No platforms yet. Tap ➕ Add Platform to create one.')
+        return
+    lines = []
+    for k,p in db['platforms'].items():
+        ch = ', '.join(db['channels'].get(c,c) for c in p.get('channels',[])) or 'Not assigned'
+        status = 'ON' if p.get('enabled', True) else 'PAUSED'
+        lines.append(f'• {p["name"]} [{status}]\n  Domains: {", ".join(p.get("domains",[]))}\n  Channels: {ch}\n  Schedule: {", ".join(p.get("times",[])) or "Not set"} | Batch: {p.get("count",1)}')
+    await update.message.reply_text('\n\n'.join(lines), reply_markup=platform_keyboard('manage'))
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    user_state = context.user_data.get("state")
-
-    # Bot username fetch
-    bot_username = context.bot_data.get("username")
-    if not bot_username:
-        bot_info = await context.bot.get_me()
-        bot_username = bot_info.username
-        context.bot_data["username"] = bot_username
-
-    # 1. ➕ Add Channel - Instant One-Click Link
-    if text == "➕ Add Channel":
-        context.user_data.clear()
-        add_channel_url = f"https://t.me/{bot_username}?startchannel=botstart&admin=post_messages+edit_messages+delete_messages"
-        
-        inline_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Choose Channel & Add as Admin", url=add_channel_url)]
-        ])
-        
-        await update.message.reply_text(
-            "👇 **Tap the button below** to see all the channels you own/manage.\n\n"
-            "Select your channel and confirm to add the bot as Admin. "
-            "Once added, the bot will automatically register the channel!",
-            reply_markup=inline_kb,
-            parse_mode="Markdown"
-        )
-        return
-
-    elif text == "⏰ Set Time":
-        context.user_data.clear()
-        await show_time_slots(update)
-        return
-
-    elif text == "🔢 Set Count":
-        context.user_data["state"] = "awaiting_count"
-        await update.message.reply_text(
-            f"Current count: **{bot_db.get('send_count', 1)}**\n"
-            "Send the number of messages to post at each scheduled time:"
-        )
-        return
-
-    elif text == "🗑 Delete Channel":
-        context.user_data.clear()
-        if not bot_db["channels"]:
-            await update.message.reply_text("ℹ️ No channels added yet.")
-            return
-
-        keyboard = []
-        for chat_id, title in bot_db["channels"].items():
-            keyboard.append([
-                InlineKeyboardButton(f"🗑 {title}", callback_data=f"del_chan_{chat_id}")
-            ])
-        await update.message.reply_text(
-            "Select a channel to remove:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-
-    elif text == "📋 Queue":
-        context.user_data.clear()
-        chan_list = "\n".join([f"• {title} (`{cid}`)" for cid, title in bot_db["channels"].items()]) or "None"
-        times_list = ", ".join(sorted(bot_db["scheduled_times"])) or "None"
-        backup = bot_db.get("backup_channel") or "Not set"
-        queue_count = len(bot_db["queue"])
-
-        msg = (
-            f"📊 **System Status & Queue Summary**\n\n"
-            f"📦 **Queued Messages:** {queue_count}\n"
-            f"🔢 **Batch Send Count:** {bot_db['send_count']}\n"
-            f"🔗 **Backup Link:** {backup}\n\n"
-            f"⏰ **Active Schedule Times:**\n{times_list}\n\n"
-            f"📢 **Connected Channels:**\n{chan_list}"
-        )
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        return
-
-    elif text == "❌ Delete Queue":
-        if not bot_db["queue"]:
-            await update.message.reply_text("The queue is currently empty.")
-            return
-        context.user_data["state"] = "awaiting_delete_queue"
-        await update.message.reply_text(
-            f"Current queue size: **{len(bot_db['queue'])}**\n"
-            "How many messages do you want to delete from the end of the queue?"
-        )
-        return
-
-    elif text == "🔗 Add Backup Channel":
-        context.user_data["state"] = "awaiting_backup"
-        await update.message.reply_text(
-            "Send the full link for your **NEW BACKUP CHANNEL** (e.g. `https://t.me/yourchannel`):"
-        )
-        return
-
-    # Handle State Responses
-    if user_state == "awaiting_count":
-        if text.isdigit() and int(text) > 0:
-            bot_db["send_count"] = int(text)
-            save_data()
-            context.user_data.clear()
-            await update.message.reply_text(
-                f"✅ Send count set to: **{bot_db['send_count']}**",
-                reply_markup=get_main_keyboard()
-            )
-        else:
-            await update.message.reply_text("⚠️ Please send a valid positive number.")
-        return
-
-    if user_state == "awaiting_backup":
-        bot_db["backup_channel"] = text
-        save_data()
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Backup channel link saved:\n`{bot_db['backup_channel']}`",
-            parse_mode="Markdown",
-            reply_markup=get_main_keyboard()
-        )
-        return
-
-    if user_state == "awaiting_delete_queue":
-        if text.isdigit():
-            count = int(text)
-            current_len = len(bot_db["queue"])
-            del_count = min(count, current_len)
-            if del_count > 0:
-                bot_db["queue"] = bot_db["queue"][:-del_count]
-                save_data()
-                await update.message.reply_text(
-                    f"✅ Deleted last {del_count} message(s).\nRemaining in queue: {len(bot_db['queue'])}",
-                    reply_markup=get_main_keyboard()
-                )
-            else:
-                await update.message.reply_text("Queue is empty.", reply_markup=get_main_keyboard())
-            context.user_data.clear()
-        else:
-            await update.message.reply_text("⚠️ Please send a valid number.")
-        return
-
-# ----------------- Time Matrix -----------------
-async def show_time_slots(update: Update):
-    keyboard = []
-    current_selected = set(bot_db.get("scheduled_times", []))
-
-    for hour in range(24):
-        row = []
-        for minute in (0, 30):
-            t_str = f"{hour:02d}:{minute:02d}"
-            check = "✅ " if t_str in current_selected else ""
-            row.append(InlineKeyboardButton(f"{check}{t_str}", callback_data=f"toggle_time_{t_str}"))
-        keyboard.append(row)
-
-    keyboard.append([InlineKeyboardButton("💾 Save / Close", callback_data="close_time_menu")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if update.message:
-        await update.message.reply_text("Select execution times (24-hour format):", reply_markup=reply_markup)
-    elif update.callback_query:
-        await update.callback_query.edit_message_reply_markup(reply_markup=reply_markup)
-
-# ----------------- Callbacks -----------------
-async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    await query.answer()
-
-    if data.startswith("toggle_time_"):
-        t_str = data.replace("toggle_time_", "")
-        times = bot_db.get("scheduled_times", [])
-        if t_str in times:
-            times.remove(t_str)
-        else:
-            times.append(t_str)
-        bot_db["scheduled_times"] = times
-        save_data()
-        await show_time_slots(update)
-
-    elif data == "close_time_menu":
-        await query.edit_message_text(
-            f"✅ Schedule updated.\nActive times: {', '.join(sorted(bot_db['scheduled_times'])) or 'None'}"
-        )
-
-    elif data.startswith("del_chan_"):
-        chat_id = data.replace("del_chan_", "")
-        removed = bot_db["channels"].pop(chat_id, None)
-        save_data()
-        await query.edit_message_text(f"🗑 Channel removed: **{removed or chat_id}**", parse_mode="Markdown")
-
-# ----------------- Forward / Queue Listener -----------------
-def extract_flezen_link(caption_or_text: str) -> str:
-    if not caption_or_text:
-        return ""
-    
-    words = caption_or_text.split()
-    
-    # 1. First check if there is an explicit http/https URL anywhere in the text
-    for word in words:
-        if word.startswith("http://") or word.startswith("https://") or "t.me/" in word:
-            return word
-            
-    # 2. If "flezen" exists, look for the next word which might be the link/identifier
-    for i, word in enumerate(words):
-        if "flezen" in word.lower():
-            # Jodi flezen-er por kono word thake, ta return korbe
-            if i + 1 < len(words):
-                return words[i + 1]
-            return word
-            
-    return ""
-
-async def handle_forwarded_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update): return
     msg = update.message
-    if not (msg.forward_origin or msg.forward_from_chat or msg.forward_from or msg.forward_date):
+    text = (msg.text or '').strip()
+    state = context.user_data.get('state')
+    if text == '➕ Add Channel': await add_channel_help(msg, context); return
+    if text == '📢 Channels':
+        if not db['channels']: await msg.reply_text('No channels connected yet.')
+        else: await msg.reply_text('Connected channels:\n' + '\n'.join(f'• {v} ({k})' for k,v in db['channels'].items()))
         return
+    if text == '➕ Add Platform':
+        context.user_data.clear(); context.user_data['state'] = 'new_platform_name'
+        await msg.reply_text('Send the platform name (example: Flezen).'); return
+    if text == '⚙️ Manage Platforms': await show_platforms(msg); return
+    if text == '🗑 Remove Channel':
+        if not db['channels']:
+            await msg.reply_text('No channels connected yet.'); return
+        rows=[[InlineKeyboardButton('🗑 '+title,callback_data=f'removechan:{cid}')] for cid,title in db['channels'].items()]
+        await msg.reply_text('Choose a channel to remove. Its platform mappings will also be cleared:', reply_markup=InlineKeyboardMarkup(rows)); return
+    if text == '🧭 Review Unknown':
+        if not db['unknown_queue']:
+            await msg.reply_text('Unknown Queue is empty. Add the missing platform domain in Add Platform, then forward those posts again.'); return
+        rows=[[InlineKeyboardButton(p['name'],callback_data=f'reassign:{k}')] for k,p in db['platforms'].items()]
+        rows.append([InlineKeyboardButton('🗑 Clear Unknown Queue',callback_data='clear:unknown')])
+        await msg.reply_text(f'{len(db["unknown_queue"])} post(s) have unmatched links. Select a platform to move all of them into its queue, or clear them.', reply_markup=InlineKeyboardMarkup(rows)); return
+    if text == '📥 Queues':
+        lines = [f'• {p["name"]}: {sum(1 for q in db["queue"] if q["platform"]==k)} pending' for k,p in db['platforms'].items()]
+        lines.append(f'• Unknown / unconfigured: {len(db["unknown_queue"])} pending')
+        await msg.reply_text('Queue status:\n' + ('\n'.join(lines) if lines else 'No platforms configured.')); return
+    if text == '⏰ Schedules':
+        if not db['platforms']: await msg.reply_text('Add a platform first.'); return
+        await msg.reply_text('Choose a platform to edit its schedule:', reply_markup=platform_keyboard('schedule')); return
+    if text == '📊 Statistics':
+        lines = [f'Queued: {len(db["queue"])} | Unknown: {len(db["unknown_queue"])} | History: {len(db["history"])}']
+        for k,p in db['platforms'].items():
+            lines.append(f'{p["name"]}: {sum(1 for q in db["queue"] if q["platform"]==k)} pending, {len(p.get("channels",[]))} channel(s)')
+        await msg.reply_text('\n'.join(lines)); return
+    if text == '⏸ Pause / Resume':
+        await msg.reply_text('Choose a platform:', reply_markup=platform_keyboard('pause')); return
+    if text == '🧹 Clear Queue':
+        await msg.reply_text('Choose which queue to clear:', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(p['name'],callback_data=f'clear:{k}')] for k,p in db['platforms'].items()] + [[InlineKeyboardButton('Unknown queue',callback_data='clear:unknown')]])); return
+    if text == '❓ Help':
+        await msg.reply_text('Forward a post to me. I detect its platform from the URL domain and place it in that platform’s own queue. Each platform sends only to its assigned channel(s). Add platform domains under Add Platform. Unknown links go to Unknown Queue; they are never sent to another platform’s channel.'); return
 
-    content_type = "photo" if msg.photo else "video" if msg.video else "text"
-    file_id = msg.photo[-1].file_id if msg.photo else msg.video.file_id if msg.video else None
-    raw_caption = msg.caption or msg.text or ""
+    if state == 'new_platform_name':
+        if not text or len(text)>40: await msg.reply_text('Please send a platform name up to 40 characters.'); return
+        context.user_data['new_name'] = text; context.user_data['state'] = 'new_platform_domains'
+        await msg.reply_text('Now send its domain(s), separated by commas. Example: example.com, links.example.net'); return
+    if state == 'new_platform_domains':
+        domains = list(dict.fromkeys(norm_domain(x) for x in text.split(',') if norm_domain(x)))
+        if not domains: await msg.reply_text('I could not read a domain. Send one or more domains, e.g. example.com'); return
+        name = context.user_data['new_name']; key = platform_key(name)
+        db['platforms'][key] = {'name':name, 'domains':domains, 'channels':[], 'times':[], 'count':1, 'backup':'', 'enabled':True}
+        save_db(); context.user_data.clear()
+        await msg.reply_text(f'✅ Platform created: {name}\nDomains: {", ".join(domains)}\nNext: Manage Platforms → {name} → Assign channels and set schedule.', reply_markup=MAIN_KB); return
+    if state and state.startswith('schedule_times:'):
+        key = state.split(':',1)[1]
+        vals = [x.strip() for x in text.split(',') if x.strip()]
+        if any(not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', x) for x in vals):
+            await msg.reply_text('Invalid time. Use 24-hour format separated by commas, e.g. 09:00, 12:30, 18:00.'); return
+        db['platforms'][key]['times'] = sorted(set(vals)); save_db(); context.user_data.clear()
+        await msg.reply_text('✅ Schedule saved.', reply_markup=MAIN_KB); return
+    if state and state.startswith('count:'):
+        key = state.split(':',1)[1]
+        if not text.isdigit() or not 1 <= int(text) <= 100: await msg.reply_text('Enter a number from 1 to 100.'); return
+        db['platforms'][key]['count'] = int(text); save_db(); context.user_data.clear()
+        await msg.reply_text('✅ Batch count saved.', reply_markup=MAIN_KB); return
+    if state and state.startswith('backup:'):
+        key = state.split(':',1)[1]
+        if text and not extract_urls(text): await msg.reply_text('Please send a valid URL, or send /skip to leave it empty.'); return
+        db['platforms'][key]['backup'] = text; save_db(); context.user_data.clear()
+        await msg.reply_text('✅ Backup link saved.', reply_markup=MAIN_KB); return
+    if text == '/skip': context.user_data.clear(); await msg.reply_text('Skipped.', reply_markup=MAIN_KB); return
 
-    extracted_link = extract_flezen_link(raw_caption)
+async def forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update): return
+    m = update.message
+    if not (m.forward_origin or m.forward_from_chat or m.forward_from or m.forward_date): return
+    raw = m.caption or m.text or ''
+    key, link = identify_platform(raw)
+    media_type, file_id = 'text', None
+    if m.photo: media_type, file_id = 'photo', m.photo[-1].file_id
+    elif m.video: media_type, file_id = 'video', m.video.file_id
+    elif m.document: media_type, file_id = 'document', m.document.file_id
+    elif m.animation: media_type, file_id = 'animation', m.animation.file_id
+    elif m.audio: media_type, file_id = 'audio', m.audio.file_id
+    item = {'id':f'{m.chat_id}_{m.message_id}_{int(datetime.now().timestamp())}', 'platform':key or 'unknown', 'type':media_type, 'file_id':file_id, 'raw_text':raw, 'link':link, 'sent_to':[], 'attempts':0, 'created_at':datetime.now(TZ).isoformat()}
+    if key: db['queue'].append(item)
+    else: db['unknown_queue'].append(item)
+    save_db()
+    q = len(db['queue']) if key else len(db['unknown_queue'])
+    label = db['platforms'][key]['name'] if key else 'Unknown / unconfigured platform'
+    await m.reply_text(f'📥 Added to {label}\nQueue position: #{q}\nDetected link: {link or "No URL found"}')
 
-    queue_item = {
-        "type": content_type,
-        "file_id": file_id,
-        "raw_text": raw_caption,
-        "link": extracted_link
-    }
+async def send_item(context, item, chat_id, platform):
+    backup = platform.get('backup','').strip()
+    link = item.get('link','')
+    caption_parts = []
+    if link: caption_parts += ['FULL VIDEO LINK 👇👇', link]
+    if backup: caption_parts += ['NEW BACKUP CHANNEL 👇', backup]
+    caption = '\n\n'.join(caption_parts) or item.get('raw_text','')
+    typ, fid = item['type'], item.get('file_id')
+    if typ == 'photo': await context.bot.send_photo(chat_id=int(chat_id), photo=fid, caption=caption[:1024] if caption else None)
+    elif typ == 'video': await context.bot.send_video(chat_id=int(chat_id), video=fid, caption=caption[:1024] if caption else None)
+    elif typ == 'document': await context.bot.send_document(chat_id=int(chat_id), document=fid, caption=caption[:1024] if caption else None)
+    elif typ == 'animation': await context.bot.send_animation(chat_id=int(chat_id), animation=fid, caption=caption[:1024] if caption else None)
+    elif typ == 'audio': await context.bot.send_audio(chat_id=int(chat_id), audio=fid, caption=caption[:1024] if caption else None)
+    else: await context.bot.send_message(chat_id=int(chat_id), text=caption or item.get('raw_text','') or ' ')
 
-    bot_db["queue"].append(queue_item)
-    save_data()
+async def dispatcher(context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TZ); hm = now.strftime('%H:%M'); day_key = now.strftime('%Y-%m-%d')
+    for key, p in list(db['platforms'].items()):
+        if not p.get('enabled', True) or hm not in p.get('times',[]): continue
+        stamp = f'{day_key} {hm}'
+        if db['last_dispatch'].get(key) == stamp: continue
+        batch = [x for x in db['queue'] if x.get('platform') == key][:p.get('count',1)]
+        if not batch: continue
+        db['last_dispatch'][key] = stamp; save_db()
+        targets = p.get('channels',[])
+        if not targets: log.warning('No channel mapping for platform %s', key); continue
+        for item in batch:
+            item['attempts'] = item.get('attempts',0) + 1
+            for cid in targets:
+                if cid in item.get('sent_to',[]): continue
+                try:
+                    await send_item(context, item, cid, p)
+                    item.setdefault('sent_to',[]).append(cid)
+                    db['history'].append({'platform':key,'channel':cid,'item_id':item['id'],'sent_at':datetime.now(TZ).isoformat()})
+                except Exception as exc: log.error('Send failed platform=%s channel=%s: %s',key,cid,exc)
+            save_db()
+            if all(cid in item.get('sent_to',[]) for cid in targets):
+                if item in db['queue']: db['queue'].remove(item)
+        save_db()
 
-    await msg.reply_text(
-        f"📥 Message added to queue!\n"
-        f"Position: **#{len(bot_db['queue'])}**\n"
-        f"Detected Link: `{extracted_link or 'None'}`",
-        parse_mode="Markdown"
-    )
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_owner(update): await q.edit_message_text('Owner access only.'); return
+    data = q.data
+    if data.startswith('manage:'):
+        key=data.split(':',1)[1]; p=db['platforms'].get(key)
+        if not p: return
+        kb=InlineKeyboardMarkup([
+            [InlineKeyboardButton('📢 Assign channels',callback_data=f'assign:{key}')],
+            [InlineKeyboardButton('⏰ Set schedule',callback_data=f'settime:{key}')],
+            [InlineKeyboardButton('🔢 Set batch count',callback_data=f'setcount:{key}')],
+            [InlineKeyboardButton('🔗 Set backup link',callback_data=f'setbackup:{key}')],
+            [InlineKeyboardButton('⏯ Pause / Resume',callback_data=f'pause:{key}')],
+            [InlineKeyboardButton('🗑 Delete platform',callback_data=f'deleteplat:{key}')]
+        ])
+        await q.edit_message_text(f'{p["name"]}\nDomains: {", ".join(p["domains"])}\nAssigned channels: {len(p["channels"])}\nSchedule: {", ".join(p["times"]) or "Not set"}',reply_markup=kb)
+    elif data.startswith('assign:'):
+        key=data.split(':',1)[1]
+        rows=[[InlineKeyboardButton(('✅ ' if cid in db['platforms'][key]['channels'] else '')+title,callback_data=f'togglechan:{key}:{cid}')] for cid,title in db['channels'].items()]
+        rows.append([InlineKeyboardButton('💾 Done',callback_data=f'manage:{key}')])
+        await q.edit_message_text('Select one or more destination channels:',reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    elif data.startswith('togglechan:'):
+        _,key,cid=data.split(':',2); arr=db['platforms'][key]['channels']
+        if cid in arr: arr.remove(cid)
+        else: arr.append(cid)
+        save_db(); rows=[[InlineKeyboardButton(('✅ ' if c in arr else '')+t,callback_data=f'togglechan:{key}:{c}')] for c,t in db['channels'].items()]
+        rows.append([InlineKeyboardButton('💾 Done',callback_data=f'manage:{key}')])
+        await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    elif data.startswith('settime:'):
+        key=data.split(':',1)[1]; context.user_data['state']=f'schedule_times:{key}'
+        await q.edit_message_text('Send schedule times separated by commas, 24-hour format. Example: 09:00, 12:30, 18:00\nSend /skip to cancel.')
+    elif data.startswith('setcount:'):
+        key=data.split(':',1)[1]; context.user_data['state']=f'count:{key}'
+        await q.edit_message_text('How many posts from this platform should be sent per scheduled time? Enter 1–100.')
+    elif data.startswith('setbackup:'):
+        key=data.split(':',1)[1]; context.user_data['state']=f'backup:{key}'
+        await q.edit_message_text('Send this platform’s backup URL, or /skip to cancel.')
+    elif data.startswith('pause:'):
+        key=data.split(':',1)[1]; p=db['platforms'][key]; p['enabled']=not p.get('enabled',True); save_db()
+        await q.edit_message_text(f'{p["name"]}: {"Enabled" if p["enabled"] else "Paused"}')
+    elif data.startswith('deleteplat:'):
+        key=data.split(':',1)[1]; name=db['platforms'].pop(key,None)
+        # Keep queued items safe by moving them to unknown queue.
+        moved=[x for x in db['queue'] if x.get('platform')==key]
+        db['queue']=[x for x in db['queue'] if x.get('platform')!=key]
+        for x in moved: x['platform']='unknown'; db['unknown_queue'].append(x)
+        save_db(); await q.edit_message_text(f'Platform deleted: {name["name"] if name else key}. Its pending posts were moved to Unknown Queue.')
+    elif data.startswith('schedule:'):
+        key=data.split(':',1)[1]; p=db['platforms'][key]
+        await q.edit_message_text(f'{p["name"]} current schedule: {", ".join(p["times"]) or "Not set"}\nUse Manage Platforms to edit it.')
+    elif data.startswith('pause:'):
+        key=data.split(':',1)[1]; p=db['platforms'][key]; p['enabled']=not p.get('enabled',True); save_db(); await q.edit_message_text('Updated.')
+    elif data.startswith('removechan:'):
+        cid=data.split(':',1)[1]; title=db['channels'].pop(cid,None)
+        for p in db['platforms'].values():
+            p['channels']=[x for x in p.get('channels',[]) if x != cid]
+        save_db(); await q.edit_message_text(f'Removed channel: {title or cid}. Platform mappings updated.')
+    elif data.startswith('reassign:'):
+        key=data.split(':',1)[1]; moved=len(db['unknown_queue'])
+        for item in db['unknown_queue']:
+            item['platform']=key; item['sent_to']=[]
+            db['queue'].append(item)
+        db['unknown_queue']=[]; save_db()
+        await q.edit_message_text(f'Moved {moved} post(s) to {db["platforms"][key]["name"]} queue. They will go only to that platform’s assigned channels.')
+    elif data.startswith('clear:'):
+        key=data.split(':',1)[1]
+        if key=='unknown': n=len(db['unknown_queue']); db['unknown_queue']=[]
+        else: n=sum(1 for x in db['queue'] if x.get('platform')==key); db['queue']=[x for x in db['queue'] if x.get('platform')!=key]
+        save_db(); await q.edit_message_text(f'Cleared {n} queued post(s).')
 
-# ----------------- Dispatcher -----------------
-async def dispatch_scheduled_batch(context: ContextTypes.DEFAULT_TYPE):
-    now_str = datetime.now(TIMEZONE).strftime("%H:%M")
-    if now_str not in bot_db.get("scheduled_times", []):
-        return
+async def error_handler(update, context): log.exception('Update error: %s', context.error)
 
-    if not bot_db["queue"] or not bot_db["channels"]:
-        return
-
-    count = bot_db.get("send_count", 1)
-    backup_link = bot_db.get("backup_channel", "").strip()
-
-    items_to_send = bot_db["queue"][:count]
-    bot_db["queue"] = bot_db["queue"][count:]
-    save_data()
-
-    for item in items_to_send:
-        link_str = item.get("link", "")
-        formatted_caption = (
-            f"FULL VIDEO LINK 👇👇\n"
-            f"{link_str}\n\n"
-            f"NEW BACKUP CHANNEL 👇\n"
-            f"{backup_link}"
-        )
-
-        for chat_id in bot_db["channels"].keys():
-            try:
-                if item["type"] == "photo":
-                    await context.bot.send_photo(
-                        chat_id=int(chat_id),
-                        photo=item["file_id"],
-                        caption=formatted_caption
-                    )
-                elif item["type"] == "video":
-                    await context.bot.send_video(
-                        chat_id=int(chat_id),
-                        video=item["file_id"],
-                        caption=formatted_caption
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=int(chat_id),
-                        text=formatted_caption
-                    )
-            except Exception as e:
-                logging.error(f"Error sending to {chat_id}: {e}")
-
-# ----------------- Main -----------------
 def main():
-    threading.Thread(target=run_flask, daemon=True).start()
+    if not TOKEN or TOKEN == '8863781796:AAF7LQwOQJkWYSNtqaz1P-pZzVNIxfzCGUs':
+        raise RuntimeError('Open msgbot.py and paste your NEW BotFather token into TOKEN first.')
+    if not OWNER_ID:8984439807
+        raise RuntimeError('Set OWNER_ID in msgbot.py before starting the bot.')
+    threading.Thread(target=run_web,daemon=True).start()
+    application=ApplicationBuilder().token(TOKEN).build()
+    application.add_handler(CommandHandler('start',start))
+    application.add_handler(CommandHandler('skip',skip_command))
+    application.add_handler(ChatMemberHandler(on_bot_membership,ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(CallbackQueryHandler(callbacks))
+    application.add_handler(MessageHandler(filters.FORWARDED & (filters.PHOTO|filters.VIDEO|filters.Document.ALL|filters.ANIMATION|filters.AUDIO|filters.TEXT),forwarded))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
+    if application.job_queue: application.job_queue.run_repeating(dispatcher,interval=15,first=10)
+    application.add_error_handler(error_handler)
+    application.run_polling(drop_pending_updates=False)
 
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # Handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(ChatMemberHandler(handle_bot_promoted, ChatMemberHandler.MY_CHAT_MEMBER))
-    application.add_handler(CallbackQueryHandler(handle_callbacks))
-    application.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_content))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(dispatch_scheduled_batch, interval=30, first=5)
-
-    application.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': main()
