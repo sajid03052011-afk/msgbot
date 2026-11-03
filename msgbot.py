@@ -10,7 +10,7 @@ from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
 
 # Paste a NEW BotFather token here before uploading/deploying.
 # The previously shared token should be revoked and must not be reused.
-TOKEN = 'PASTE_NEW_BOT_TOKEN_HERE'
+TOKEN = '8863781796:AAF7LQwOQJkWYSNtqaz1P-pZzVNIxfzCGUs'
 OWNER_ID = 8984439807
 DATA_FILE = Path('bot_data.json')
 TZ = pytz.timezone('Asia/Kolkata')
@@ -350,9 +350,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update, context): log.exception('Update error: %s', context.error)
 
 def main():
-    if not TOKEN or TOKEN == '8863781796:AAF7LQwOQJkWYSNtqaz1P-pZzVNIxfzCGUs':
+    if not TOKEN or TOKEN == 'PASTE_NEW_BOT_TOKEN_HERE':
         raise RuntimeError('Open msgbot.py and paste your NEW BotFather token into TOKEN first.')
-    if not OWNER_ID:8984439807
+    if not OWNER_ID:
         raise RuntimeError('Set OWNER_ID in msgbot.py before starting the bot.')
     threading.Thread(target=run_web,daemon=True).start()
     application=ApplicationBuilder().token(TOKEN).build()
